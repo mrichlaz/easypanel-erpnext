@@ -1,71 +1,53 @@
 services:
-  # --- DATABASE ---
+  # --- CORE SERVICES ---
   db:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: mariadb:11.4
-    restart: unless-stopped
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --skip-character-set-client-handshake
-      - --max-connections=500
-    environment:
-      MYSQL_ROOT_PASSWORD: admin
-      MYSQL_DATABASE: erpnext
-    volumes:
-      - db-data:/var/lib/mysql
+    restart: on-failure
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 60s
+      start_period: 80s
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+    volumes:
+      - db-data:/var/lib/mysql
 
-  # --- REDIS CACHE ---
   redis-cache:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: redis:7-alpine
-    restart: unless-stopped
-    command: 
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - allkeys-lru
+    restart: on-failure
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     volumes:
       - redis-cache-data:/data
+
+  redis-queue:
+    platform: "linux/arm64"
+    image: redis:7-alpine
+    restart: on-failure
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
-
-  # --- REDIS QUEUE ---
-  redis-queue:
-    platform: linux/arm64
-    image: redis:7-alpine
-    restart: unless-stopped
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - allkeys-lru
     volumes:
       - redis-queue-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
 
-  # --- CONFIGURATOR (One-time setup) ---
+  # --- SETUP SERVICES (Run Once) ---
   configurator:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: frappe/erpnext:latest
     restart: "no"
     depends_on:
@@ -83,15 +65,15 @@ services:
       - -c
     command:
       - >
-        echo "Configuring ERPNext...";
+        echo "Starting configuration...";
         ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
-        echo "Configuration complete!"
+        bench set-config -g db_host $DB_HOST;
+        bench set-config -gp db_port $DB_PORT;
+        bench set-config -g redis_cache "redis://$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$REDIS_QUEUE";
+        bench set-config -gp socketio_port $SOCKETIO_PORT;
+        echo "Configuration complete!";
     environment:
       DB_HOST: db
       DB_PORT: "3306"
@@ -99,9 +81,8 @@ services:
       REDIS_QUEUE: redis-queue:6379
       SOCKETIO_PORT: "9000"
 
-  # --- SITE CREATOR (One-time setup) ---
   create-site:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: frappe/erpnext:latest
     restart: "no"
     depends_on:
@@ -115,108 +96,41 @@ services:
       - -c
     command:
       - >
-        echo "Waiting for services...";
         wait-for-it -t 120 db:3306;
         wait-for-it -t 60 redis-cache:6379;
         wait-for-it -t 60 redis-queue:6379;
-        echo "Creating site...";
-        bench new-site frappe.local 
-        --no-mariadb-socket 
-        --admin-password=admin 
-        --db-root-password=admin 
-        --install-app erpnext 
-        --set-default;
-        echo "Enabling scheduler...";
-        bench --site frappe.local scheduler enable;
-        bench --site frappe.local scheduler status;
-        echo "Site creation complete!"
+        if [ ! -d "sites/frappe.local" ]; then
+          echo "Creating new site frappe.local...";
+          bench new-site frappe.local --mariadb-root-username root --mariadb-root-password admin --admin-password admin --install-app erpnext --set-default;
+          echo "Enabling scheduler...";
+          bench --site frappe.local scheduler enable;
+          bench --site frappe.local scheduler status;
+        else
+          echo "Site frappe.local already exists, skipping creation...";
+          bench --site frappe.local scheduler enable;
+          bench --site frappe.local scheduler status;
+          bench --site frappe.local clear-cache;
+        fi
 
-  # --- BACKEND ---
+  # --- APPLICATION SERVICES ---
   backend:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: frappe/erpnext:latest
-    restart: unless-stopped
     depends_on:
       create-site:
         condition: service_completed_successfully
+    restart: on-failure
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
-  # --- WEBSOCKET ---
-  websocket:
-    platform: linux/arm64
-    image: frappe/erpnext:latest
-    restart: unless-stopped
-    depends_on:
-      create-site:
-        condition: service_completed_successfully
-    command:
-      - node
-      - /home/frappe/frappe-bench/apps/frappe/socketio.js
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-
-  # --- SCHEDULER ---
-  scheduler:
-    platform: linux/arm64
-    image: frappe/erpnext:latest
-    restart: unless-stopped
-    depends_on:
-      create-site:
-        condition: service_completed_successfully
-    command:
-      - bench
-      - schedule
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-
-  # --- WORKER: LONG QUEUE ---
-  queue-long:
-    platform: linux/arm64
-    image: frappe/erpnext:latest
-    restart: unless-stopped
-    depends_on:
-      create-site:
-        condition: service_completed_successfully
-    command:
-      - bench
-      - worker
-      - --queue
-      - long,default,short
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-
-  # --- WORKER: SHORT QUEUE ---
-  queue-short:
-    platform: linux/arm64
-    image: frappe/erpnext:latest
-    restart: unless-stopped
-    depends_on:
-      create-site:
-        condition: service_completed_successfully
-    command:
-      - bench
-      - worker
-      - --queue
-      - short,default
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-
-  # --- FRONTEND (NGINX) ---
   frontend:
-    platform: linux/arm64
+    platform: "linux/arm64"
     image: frappe/erpnext:latest
-    restart: unless-stopped
     depends_on:
-      backend:
-        condition: service_started
-      websocket:
-        condition: service_started
+      - backend
+      - websocket
+    restart: on-failure
     command:
       - nginx-entrypoint.sh
     environment:
@@ -232,9 +146,78 @@ services:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
+  websocket:
+    platform: "linux/arm64"
+    image: frappe/erpnext:latest
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+      redis-queue:
+        condition: service_healthy
+    restart: on-failure
+    # --- CHANGE IS HERE ---
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        echo "Waiting for redis-queue to be ready..." &&
+        wait-for-it -t 60 redis-queue:6379 --strict -- &&
+        echo "Redis is ready, starting websocket service..." &&
+        node /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  scheduler:
+    platform: "linux/arm64"
+    image: frappe/erpnext:latest
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+    restart: on-failure
+    command:
+      - bench
+      - schedule
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  queue-long:
+    platform: "linux/arm64"
+    image: frappe/erpnext:latest
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+    restart: on-failure
+    command:
+      - bench
+      - worker
+      - --queue
+      - long,default,short
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  queue-short:
+    platform: "linux/arm64"
+    image: frappe/erpnext:latest
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+    restart: on-failure
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
 volumes:
   db-data:
-  redis-cache-data:
   redis-queue-data:
+  redis-cache-data:
   sites:
   logs:
